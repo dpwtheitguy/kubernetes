@@ -1,139 +1,120 @@
 #!/usr/bin/env bash
-# Purpose: Configure sysctl and iptables rules for Kubernetes labs on EC2
-# Standards: Google Shell Style, PEP20, SPLUNK CIM, PowerShell Verb-Noun
-# Author: world-class scripter™
+# Title: Kubernetes Network Setup
+# Description: Configure iptables and sysctl for Kubernetes
+# Author: You
+# Logging: CIM-friendly, PEP-compliant True/False booleans
 
 set -euo pipefail
 
-readonly SYSCTL_CONFIG="/etc/sysctl.d/k8s.conf"
-readonly IPTABLES_CONFIG="/etc/iptables/rules.v4"
-readonly SYSTEMD_UNIT="/etc/systemd/system/iptables-restore.service"
-readonly NODEPORT_RANGE_START="30000"
-readonly NODEPORT_RANGE_END="32767"
-readonly CIDR_RANGES=("10.244.0.0/16" "192.168.0.0/16")
-readonly CNI_PORTS_UDP=(4789 8472)
-readonly CNI_PORTS_TCP=(179)
-readonly SERVICE_PORTS_TCP=(6443 10250)
+# Constants
+readonly SYSCTL_CONF="/etc/sysctl.d/k8s.conf"
+readonly IPTABLES_CONF="/etc/iptables/rules.v4"
+readonly IPTABLES_DIR="$(dirname "$IPTABLES_CONF")"
 
-IPTABLES_DIR="$(dirname "$IPTABLES_CONFIG")"
-readonly IPTABLES_DIR
+readonly TCP_PORTS=(22 6443 10250 10257 10259)
+readonly ETCD_PORT_RANGE="2379:2380"
+readonly NODEPORT_RANGE="30000:32767"
+readonly UDP_PORTS=(4789 8472)
+readonly BGP_PORT=179
+readonly CIDRS=("10.244.0.0/16" "192.168.0.0/16")
 
-require-Root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    echo "event=permission_check result=failure reason=root_required" >&2
+function check-root() {
+  if [[ "$EUID" -ne 0 ]]; then
+    echo "event=script-exit app=kubernetes reason=not-root success=False" >&2
     exit 1
   fi
-  echo "event=permission_check result=success"
 }
 
-setup-Iptables() {
-  if ! command -v iptables &> /dev/null; then
-    echo "event=iptables_check result=missing action=install status=started"
-    if command -v yum &> /dev/null; then
-      yum install -y iptables
-    elif command -v dnf &> /dev/null; then
-      dnf install -y iptables
-    elif command -v apt-get &> /dev/null; then
-      apt-get update && apt-get install -y iptables
-    else
-      echo "event=iptables_install result=failure reason=unsupported_package_manager" >&2
-      exit 1
-    fi
-    echo "event=iptables_check result=installed"
-  else
-    echo "event=iptables_check result=present"
+function drop-firewall() {
+  if command -v ufw &>/dev/null; then
+    echo "event=remove-ufw app=iptables action=disabling success=True"
+    ufw disable || true
+    apt-get remove -y ufw || true
+  fi
+
+  if systemctl list-unit-files | grep -q firewalld; then
+    echo "event=remove-firewalld app=iptables action=disabling success=True"
+    systemctl stop firewalld || true
+    systemctl disable firewalld || true
+    yum remove -y firewalld || true
   fi
 }
 
-set-SysctlSettings() {
-  echo "event=sysctl_config action=set target=$SYSCTL_CONFIG status=started"
-  cat <<EOF > "$SYSCTL_CONFIG"
+function install-iptables() {
+  if ! command -v iptables &>/dev/null; then
+    echo "event=install app=iptables status=missing success=True"
+    if [ -f /etc/os-release ]; then
+      source /etc/os-release
+      if [[ "$ID" == "amzn" ]]; then
+        yum install -y iptables iptables-services
+        systemctl enable iptables
+        systemctl start iptables
+      else
+        echo "event=install-failed app=iptables reason=unsupported-distro distro=$ID success=False" >&2
+        exit 1
+      fi
+    fi
+  fi
+}
+
+function set-sysctl() {
+  echo "event=sysctl-config app=kubernetes start=True"
+  cat <<EOF > "$SYSCTL_CONF"
 net.bridge.bridge-nf-call-ip6tables = 1
 net.bridge.bridge-nf-call-iptables = 1
 EOF
   sysctl --system
-  echo "event=sysctl_config action=set target=$SYSCTL_CONFIG status=completed"
+  echo "event=sysctl-config app=kubernetes complete=True"
 }
 
-initialize-Iptables() {
-  echo "event=iptables_init action=flush status=started"
+function set-rules() {
+  echo "event=iptables-config app=iptables start=True"
+
   iptables -F
   iptables -X
-  echo "event=iptables_init action=flush status=completed"
-}
-
-set-FirewallRules() {
-  echo "event=iptables_rules action=set status=started"
 
   iptables -A INPUT -i lo -j ACCEPT
   iptables -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
   iptables -A FORWARD -m physdev --physdev-is-bridged -j ACCEPT
 
-  for cidr in "${CIDR_RANGES[@]}"; do
+  for cidr in "${CIDRS[@]}"; do
     iptables -A INPUT -s "$cidr" -j ACCEPT
   done
 
-  for port in "${SERVICE_PORTS_TCP[@]}"; do
+  for port in "${TCP_PORTS[@]}"; do
     iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
   done
 
-  for port in "${CNI_PORTS_UDP[@]}"; do
+  iptables -A INPUT -p tcp --dport "$ETCD_PORT_RANGE" -j ACCEPT
+
+  for port in "${UDP_PORTS[@]}"; do
     iptables -A INPUT -p udp --dport "$port" -j ACCEPT
   done
 
-  for port in "${CNI_PORTS_TCP[@]}"; do
-    iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
-  done
-
-  iptables -A INPUT -p tcp --dport "${NODEPORT_RANGE_START}:${NODEPORT_RANGE_END}" -j ACCEPT
+  iptables -A INPUT -p tcp --dport "$BGP_PORT" -j ACCEPT
+  iptables -A INPUT -p tcp --dport "$NODEPORT_RANGE" -j ACCEPT
   iptables -A INPUT -p icmp -j ACCEPT
+
   iptables -A INPUT -j DROP
 
-  echo "event=iptables_rules action=set status=completed"
-}
-
-save-Iptables() {
-  echo "event=iptables_save action=write target=$IPTABLES_CONFIG status=started"
   mkdir -p "$IPTABLES_DIR"
-  iptables-save > "$IPTABLES_CONFIG"
-  echo "event=iptables_save action=write target=$IPTABLES_CONFIG status=completed"
+  iptables-save > "$IPTABLES_CONF"
+
+  if systemctl list-unit-files | grep -q iptables.service; then
+    systemctl enable iptables
+    systemctl restart iptables
+  fi
+
+  echo "event=iptables-config app=iptables complete=True"
 }
 
-enable-IptablesBootRestore() {
-  echo "event=iptables_boot_restore action=configure target=$SYSTEMD_UNIT status=started"
-  cat <<EOF > "$SYSTEMD_UNIT"
-[Unit]
-Description=Restore iptables rules
-DefaultDependencies=no
-Before=network-pre.target
-Wants=network-pre.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/sbin/iptables-restore < $IPTABLES_CONFIG
-ExecReload=/usr/sbin/iptables-restore < $IPTABLES_CONFIG
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  chmod 644 "$SYSTEMD_UNIT"
-  systemctl daemon-reexec
-  systemctl daemon-reload
-  systemctl enable iptables-restore.service
-  echo "event=iptables_boot_restore action=configure status=completed"
+function run-setup() {
+  check-root
+  drop-firewall
+  install-iptables
+  set-sysctl
+  set-rules
+  echo "event=network-setup app=kubernetes status=completed success=True"
 }
 
-main() {
-  require-Root
-  setup-Iptables
-  set-SysctlSettings
-  initialize-Iptables
-  set-FirewallRules
-  save-Iptables
-  enable-IptablesBootRestore
-  echo "event=script_complete message='Kubernetes iptables and sysctl configuration applied successfully.'"
-}
-
-main
+run-setup
